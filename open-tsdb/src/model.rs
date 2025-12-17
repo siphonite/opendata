@@ -87,6 +87,7 @@ pub(crate) struct Sample {
 /// A sample with all its attributes, including the metric name
 #[derive(Clone, Debug)]
 pub(crate) struct SampleWithAttributes {
+    // TODO: this should be SeriesSample and use SeriesSpec
     pub(crate) attributes: Vec<Attribute>,
     pub(crate) metric_unit: Option<String>,
     pub(crate) metric_type: MetricType,

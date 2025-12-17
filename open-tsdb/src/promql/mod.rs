@@ -1,4 +1,5 @@
 mod evaluator;
+mod functions;
 mod parser;
 mod request;
 mod response;

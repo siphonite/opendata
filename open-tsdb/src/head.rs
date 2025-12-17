@@ -62,6 +62,11 @@ impl TsdbHead {
         &self.inverted_index
     }
 
+    /// Returns a reference to the samples map
+    pub(crate) fn samples(&self) -> &DashMap<SeriesId, Vec<Sample>> {
+        &self.samples
+    }
+
     pub fn merge(&self, delta: &TsdbDelta) -> Result<()> {
         if self.frozen.load(Ordering::SeqCst) {
             return Err(OpenTsdbError::Internal("TsdbHead is frozen".to_string()));
@@ -75,6 +80,7 @@ impl TsdbHead {
         }
 
         for (series_id, delta_samples) in &delta.samples {
+            // TODO(agavra): do we need to sort here?
             self.samples
                 .entry(*series_id)
                 .or_default()
