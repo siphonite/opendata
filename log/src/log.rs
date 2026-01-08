@@ -18,7 +18,7 @@ use common::{
 use crate::config::{CountOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, Result};
 use crate::model::{LogEntry, Record};
-use crate::reader::{LogRead, LogReader};
+use crate::reader::LogRead;
 use crate::sequence::{SeqBlockStore, SequenceAllocator};
 use crate::serde::LogEntryKey;
 
@@ -122,7 +122,7 @@ impl LogIterator {
 /// use bytes::Bytes;
 ///
 /// // Open a log (implementation details TBD)
-/// let log = Log::open(path, options).await?;
+/// let log = Log::open(config).await?;
 ///
 /// // Append records
 /// let records = vec![
@@ -132,13 +132,10 @@ impl LogIterator {
 /// log.append(records).await?;
 ///
 /// // Scan entries for a specific key
-/// let mut iter = log.scan(Bytes::from("user:123"), ..);
+/// let mut iter = log.scan(Bytes::from("user:123"), ..).await?;
 /// while let Some(entry) = iter.next().await? {
 ///     println!("seq={}: {:?}", entry.sequence, entry.value);
 /// }
-///
-/// // Get a read-only view
-/// let reader = log.reader();
 /// ```
 pub struct Log {
     storage: Arc<dyn Storage>,
@@ -278,27 +275,17 @@ impl Log {
         Ok(())
     }
 
-    /// Creates a read-only view of the log.
-    ///
-    /// The returned [`LogReader`] provides access to all read operations
-    /// ([`scan`](LogRead::scan), [`count`](LogRead::count)) but not write
-    /// operations. This is useful for consumers that should not have write
-    /// access to the log.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let reader = log.reader();
-    ///
-    /// // Reader can scan and count
-    /// let iter = reader.scan(Bytes::from("orders"), ..);
-    /// let count = reader.count(Bytes::from("orders"), ..).await?;
-    ///
-    /// // But cannot append (this would be a compile error):
-    /// // reader.append(records).await?; // ERROR: no method `append`
-    /// ```
-    pub fn reader(&self) -> LogReader {
-        todo!()
+    /// Creates a Log from an existing storage implementation.
+    #[cfg(test)]
+    pub(crate) async fn new(storage: Arc<dyn Storage>) -> Result<Self> {
+        let block_store = SeqBlockStore::new(Arc::clone(&storage));
+        let sequence_allocator = SequenceAllocator::new(block_store);
+        sequence_allocator.initialize().await?;
+
+        Ok(Self {
+            storage,
+            sequence_allocator,
+        })
     }
 }
 
@@ -743,5 +730,50 @@ mod tests {
 
         // then
         assert!(entry.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_scan_entries_via_log_reader() {
+        use crate::reader::LogReader;
+        use common::storage::factory::create_storage;
+
+        // given - create shared storage
+        let storage = create_storage(&StorageConfig::InMemory, None)
+            .await
+            .unwrap();
+        let log = Log::new(storage.clone()).await.unwrap();
+        log.append(vec![
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-1"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-2"),
+            },
+            Record {
+                key: Bytes::from("orders"),
+                value: Bytes::from("order-3"),
+            },
+        ])
+        .await
+        .unwrap();
+
+        // when - create LogReader sharing the same storage
+        let reader = LogReader::new(storage);
+        let mut iter = reader.scan(Bytes::from("orders"), ..).await.unwrap();
+        let mut entries = vec![];
+        while let Some(entry) = iter.next().await.unwrap() {
+            entries.push(entry);
+        }
+
+        // then
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].value, Bytes::from("order-1"));
+        assert_eq!(entries[1].sequence, 1);
+        assert_eq!(entries[1].value, Bytes::from("order-2"));
+        assert_eq!(entries[2].sequence, 2);
+        assert_eq!(entries[2].value, Bytes::from("order-3"));
     }
 }
