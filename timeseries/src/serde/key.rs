@@ -5,62 +5,7 @@ use crate::model::{BucketSize, BucketStart, SeriesFingerprint, SeriesId};
 use bytes::{Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
-
-/// Encodes a string as a tuple element for inverted index keys.
-///
-/// This uses a FoundationDB-style tuple encoding with a `0x00` delimiter
-/// to preserve lexicographical ordering for range scans. This helper is
-/// intentionally scoped to inverted index key encoding and does not replace
-/// shared UTF-8 encoding utilities.
-fn encode_tuple_string(buf: &mut Vec<u8>, s: &str) {
-    for b in s.as_bytes() {
-        if *b == 0x00 {
-            // Escape null bytes
-            buf.push(0x00);
-            buf.push(0xFF);
-        } else {
-            buf.push(*b);
-        }
-    }
-    // Tuple element terminator
-    buf.push(0x00);
-}
-
-/// Decodes a tuple-encoded string element from inverted index keys.
-///
-/// This is the inverse of `encode_tuple_string`. It reads bytes until a
-/// `0x00` terminator is found, unescaping `0x00 0xFF` sequences back to
-/// literal `0x00` bytes. This helper is intentionally scoped to inverted
-/// index key decoding and does not replace shared UTF-8 decoding utilities.
-fn decode_tuple_string(buf: &mut &[u8]) -> Result<String, EncodingError> {
-    let mut bytes = Vec::new();
-    let mut i = 0;
-
-    while i < buf.len() {
-        let b = buf[i];
-        if b == 0x00 {
-            // Check if this is an escape sequence or terminator
-            if i + 1 < buf.len() && buf[i + 1] == 0xFF {
-                // Escaped null byte
-                bytes.push(0x00);
-                i += 2;
-            } else {
-                // Terminator found
-                *buf = &buf[i + 1..];
-                return String::from_utf8(bytes).map_err(|e| EncodingError {
-                    message: format!("Invalid UTF-8 in tuple string: {}", e),
-                });
-            }
-        } else {
-            bytes.push(b);
-            i += 1;
-        }
-    }
-
-    Err(EncodingError {
-        message: "Missing terminator in tuple-encoded string".to_string(),
-    })
-}
+use common::serde::terminated_bytes;
 
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,30 +177,28 @@ pub struct InvertedIndexKey {
 
 impl InvertedIndexKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = Vec::new();
-        let mut prefix_buf = BytesMut::new();
+        let mut buf = BytesMut::new();
         RecordType::InvertedIndex
             .prefix_with_bucket_size(self.bucket_size)
-            .write_to(&mut prefix_buf);
-        buf.extend_from_slice(&prefix_buf);
+            .write_to(&mut buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
-        encode_tuple_string(&mut buf, &self.attribute);
-        encode_tuple_string(&mut buf, &self.value);
-        Bytes::from(buf)
+        // Attribute uses terminated encoding to delimit from value
+        terminated_bytes::serialize(self.attribute.as_bytes(), &mut buf);
+        // Value is raw UTF-8 (no terminator needed - end of key acts as delimiter)
+        buf.extend_from_slice(self.value.as_bytes());
+        buf.freeze()
     }
 
     /// Create a BytesRange that covers all entries for a specific attribute (label name)
     /// within a given bucket. This allows efficient scanning for all values of a label.
     pub fn attribute_range(bucket: &crate::model::TimeBucket, attribute: &str) -> BytesRange {
-        let mut buf = Vec::new();
-        let mut prefix_buf = BytesMut::new();
+        let mut buf = BytesMut::new();
         RecordType::InvertedIndex
             .prefix_with_bucket_size(bucket.size)
-            .write_to(&mut prefix_buf);
-        buf.extend_from_slice(&prefix_buf);
+            .write_to(&mut buf);
         buf.extend_from_slice(&bucket.start.to_be_bytes());
-        encode_tuple_string(&mut buf, attribute);
-        BytesRange::prefix(Bytes::from(buf))
+        terminated_bytes::serialize(attribute.as_bytes(), &mut buf);
+        BytesRange::prefix(buf.freeze())
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -282,8 +225,16 @@ impl InvertedIndexKey {
         let time_bucket = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
         slice = &slice[4..];
 
-        let attribute = decode_tuple_string(&mut slice)?;
-        let value = decode_tuple_string(&mut slice)?;
+        // Attribute uses terminated encoding
+        let attribute_bytes = terminated_bytes::deserialize(&mut slice)?;
+        let attribute = String::from_utf8(attribute_bytes.to_vec()).map_err(|e| EncodingError {
+            message: format!("Invalid UTF-8 in attribute: {}", e),
+        })?;
+
+        // Value is the remaining bytes (raw UTF-8, no terminator)
+        let value = String::from_utf8(slice.to_vec()).map_err(|e| EncodingError {
+            message: format!("Invalid UTF-8 in value: {}", e),
+        })?;
 
         Ok(InvertedIndexKey {
             time_bucket,
@@ -546,6 +497,47 @@ mod tests {
         assert!(
             !range.contains(&short_attr_key.encode()),
             "attribute_range for 'abcdef' should not match key with attribute='ab' value='cdef'"
+        );
+    }
+
+    #[test]
+    fn should_encode_attribute_with_terminator_and_value_without() {
+        // This test demonstrates and verifies that:
+        // - Only the attribute uses terminated encoding (with 0x00 delimiter)
+        // - The value uses raw UTF-8 (no terminator, delimited by end of key)
+        //
+        // This is sufficient because the attribute terminator separates attribute
+        // from value, and the value extends to the end of the key.
+
+        let key = InvertedIndexKey {
+            time_bucket: 12345,
+            attribute: "host".to_string(),
+            value: "server1".to_string(),
+            bucket_size: 1,
+        };
+
+        let encoded = key.encode();
+
+        // Verify it round-trips correctly
+        let decoded = InvertedIndexKey::decode(&encoded).unwrap();
+        assert_eq!(decoded.attribute, "host");
+        assert_eq!(decoded.value, "server1");
+
+        // Verify the key ends with raw "server1" bytes (no trailing 0x00)
+        let value_bytes = b"server1";
+        assert!(
+            encoded.ends_with(value_bytes),
+            "Encoded key should end with raw value bytes (no terminator)"
+        );
+
+        // The encoded key should contain the 0x00 terminator after the attribute
+        // but NOT after the value. We can verify by checking the byte before "server1"
+        // is 0x00 (the attribute terminator).
+        let value_start = encoded.len() - value_bytes.len();
+        assert_eq!(
+            encoded[value_start - 1],
+            0x00,
+            "Byte before value should be 0x00 (attribute terminator)"
         );
     }
 }
