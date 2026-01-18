@@ -6,6 +6,62 @@ use bytes::{Bytes, BytesMut};
 use common::BytesRange;
 use common::serde::key_prefix::KeyPrefix;
 
+/// Encodes a string as a tuple element for inverted index keys.
+///
+/// This uses a FoundationDB-style tuple encoding with a `0x00` delimiter
+/// to preserve lexicographical ordering for range scans. This helper is
+/// intentionally scoped to inverted index key encoding and does not replace
+/// shared UTF-8 encoding utilities.
+fn encode_tuple_string(buf: &mut Vec<u8>, s: &str) {
+    for b in s.as_bytes() {
+        if *b == 0x00 {
+            // Escape null bytes
+            buf.push(0x00);
+            buf.push(0xFF);
+        } else {
+            buf.push(*b);
+        }
+    }
+    // Tuple element terminator
+    buf.push(0x00);
+}
+
+/// Decodes a tuple-encoded string element from inverted index keys.
+///
+/// This is the inverse of `encode_tuple_string`. It reads bytes until a
+/// `0x00` terminator is found, unescaping `0x00 0xFF` sequences back to
+/// literal `0x00` bytes. This helper is intentionally scoped to inverted
+/// index key decoding and does not replace shared UTF-8 decoding utilities.
+fn decode_tuple_string(buf: &mut &[u8]) -> Result<String, EncodingError> {
+    let mut bytes = Vec::new();
+    let mut i = 0;
+
+    while i < buf.len() {
+        let b = buf[i];
+        if b == 0x00 {
+            // Check if this is an escape sequence or terminator
+            if i + 1 < buf.len() && buf[i + 1] == 0xFF {
+                // Escaped null byte
+                bytes.push(0x00);
+                i += 2;
+            } else {
+                // Terminator found
+                *buf = &buf[i + 1..];
+                return String::from_utf8(bytes).map_err(|e| EncodingError {
+                    message: format!("Invalid UTF-8 in tuple string: {}", e),
+                });
+            }
+        } else {
+            bytes.push(b);
+            i += 1;
+        }
+    }
+
+    Err(EncodingError {
+        message: "Missing terminator in tuple-encoded string".to_string(),
+    })
+}
+
 /// BucketList key (global-scoped)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketListKey;
@@ -176,26 +232,30 @@ pub struct InvertedIndexKey {
 
 impl InvertedIndexKey {
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
+        let mut prefix_buf = BytesMut::new();
         RecordType::InvertedIndex
             .prefix_with_bucket_size(self.bucket_size)
-            .write_to(&mut buf);
+            .write_to(&mut prefix_buf);
+        buf.extend_from_slice(&prefix_buf);
         buf.extend_from_slice(&self.time_bucket.to_be_bytes());
-        encode_utf8(&self.attribute, &mut buf);
-        encode_utf8(&self.value, &mut buf);
-        buf.freeze()
+        encode_tuple_string(&mut buf, &self.attribute);
+        encode_tuple_string(&mut buf, &self.value);
+        Bytes::from(buf)
     }
 
     /// Create a BytesRange that covers all entries for a specific attribute (label name)
     /// within a given bucket. This allows efficient scanning for all values of a label.
     pub fn attribute_range(bucket: &crate::model::TimeBucket, attribute: &str) -> BytesRange {
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
+        let mut prefix_buf = BytesMut::new();
         RecordType::InvertedIndex
             .prefix_with_bucket_size(bucket.size)
-            .write_to(&mut buf);
+            .write_to(&mut prefix_buf);
+        buf.extend_from_slice(&prefix_buf);
         buf.extend_from_slice(&bucket.start.to_be_bytes());
-        encode_utf8(attribute, &mut buf);
-        BytesRange::prefix(buf.freeze())
+        encode_tuple_string(&mut buf, attribute);
+        BytesRange::prefix(Bytes::from(buf))
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, EncodingError> {
@@ -222,8 +282,8 @@ impl InvertedIndexKey {
         let time_bucket = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
         slice = &slice[4..];
 
-        let attribute = decode_utf8(&mut slice)?;
-        let value = decode_utf8(&mut slice)?;
+        let attribute = decode_tuple_string(&mut slice)?;
+        let value = decode_tuple_string(&mut slice)?;
 
         Ok(InvertedIndexKey {
             time_bucket,
@@ -435,7 +495,7 @@ mod tests {
     fn should_not_match_shorter_attribute_with_value_that_looks_like_suffix() {
         // given - searching for "hostname" should NOT match a key with
         // attribute "host" and value "name" even though "host" + "name" = "hostname"
-        // The length-prefix encoding should prevent this collision.
+        // The tuple-style delimiter encoding should prevent this collision.
         let bucket = crate::model::TimeBucket {
             start: 12345,
             size: 1,
@@ -454,32 +514,30 @@ mod tests {
         assert!(
             !range.contains(&host_name_key.encode()),
             "attribute_range for 'hostname' should not match key with attribute='host' value='name'. \
-             The length-prefix encoding should differentiate them: \
-             'hostname' encodes as [len=8, ...] while 'host' encodes as [len=4, ...]"
+             The delimiter-based encoding should differentiate them."
         );
     }
 
     #[test]
     fn should_not_match_when_value_bytes_could_mimic_attribute_continuation() {
-        // given - test a more contrived case where the value length bytes
-        // might numerically match what would be expected for a longer attribute
+        // given - test a more contrived case where naive concatenation
+        // might produce a collision
         let bucket = crate::model::TimeBucket {
             start: 12345,
             size: 1,
         };
 
-        // Key with short attribute and value whose length encoding could be confused
-        // attribute "ab" (len=2) with value of length that starts with same byte
+        // Key with short attribute and value that concatenates to a different attribute
         let short_attr_key = InvertedIndexKey {
             time_bucket: 12345,
             attribute: "ab".to_string(),
-            value: "cdef".to_string(), // len=4, encoded as [0x04, 0x00] in little-endian
+            value: "cdef".to_string(),
             bucket_size: 1,
         };
 
-        // Search for "abcdef" (len=6)
+        // Search for "abcdef"
         // If encoding was naive concatenation, "ab" + "cdef" might look like "abcdef"
-        // But with length-prefix: [len=2][ab][len=4][cdef] vs [len=6][abcdef]
+        // But with tuple-style encoding, each element is delimited separately
 
         // when
         let range = InvertedIndexKey::attribute_range(&bucket, "abcdef");
