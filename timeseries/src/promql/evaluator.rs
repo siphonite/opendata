@@ -423,8 +423,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 let val = l.val;
                 Box::pin(async move { Ok(ExprResult::Scalar(val)) })
             }
-            Expr::StringLiteral(_l) => {
-                todo!()
+            Expr::StringLiteral(l) => {
+                let val = l.val.clone();
+                Box::pin(async move {
+                    Err(EvaluationError::InternalError(format!(
+                        "string literal \"{}\" cannot be evaluated as a standalone PromQL expression",
+                        val
+                    )))
+                })
             }
             Expr::VectorSelector(vector_selector) => {
                 let fut = self.evaluate_vector_selector(vector_selector, end, lookback_delta);
@@ -1738,6 +1744,39 @@ mod tests {
             ExprResult::InstantVector(_) => panic!("Expected scalar result, got vector"),
             ExprResult::RangeVector(_) => panic!("Expected scalar result, got range vector"),
         }
+    }
+
+    #[tokio::test]
+    async fn should_error_on_string_literal() {
+        // given: create an empty mock reader
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: evaluate a string literal
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::Expr::StringLiteral(
+                promql_parser::parser::StringLiteral {
+                    val: "hello".to_string(),
+                },
+            ),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let result = evaluator.evaluate(stmt).await;
+
+        // then: should return an error (string literals cannot be evaluated standalone)
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("string literal"),
+            "Error message should mention 'string literal', got: {}",
+            err
+        );
     }
 
     #[allow(clippy::type_complexity)]
