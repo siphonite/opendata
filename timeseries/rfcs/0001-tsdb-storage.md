@@ -350,10 +350,6 @@ unambiguously separated from the value field. The value does not require a
 terminator since it extends to the end of the key. This minimizes key size while
 preserving the ability to do efficient prefix scans by label name.
 
-> [!WARNING]
-> **Backward Incompatibility**: This key encoding is not backward compatible with
-> the previous length-prefixed UTF-8 encoding. Existing inverted index data must
-> be migrated or discarded before upgrading.
 
 Note that since the label names and values are stored lexicographically,
 SlateDB's prefix encoding will be very effective without the use of a
