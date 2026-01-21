@@ -1020,8 +1020,8 @@ mod tests {
     use crate::query::test_utils::MockQueryReaderBuilder;
     use crate::test_utils::assertions::approx_eq;
     use promql_parser::label::{METRIC_NAME, Matchers};
-    use promql_parser::parser::value::ValueType;
     use promql_parser::parser::EvalStmt;
+    use promql_parser::parser::value::ValueType;
     use rstest::rstest;
 
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
