@@ -427,7 +427,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 let val = l.val.clone();
                 Box::pin(async move {
                     Err(EvaluationError::InternalError(format!(
-                        "string literal \"{}\" cannot be evaluated as a standalone PromQL expression",
+                        "string literal \"{}\" is not directly evaluatable",
                         val
                     )))
                 })
@@ -648,15 +648,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )));
         }
 
-        // Evaluate the argument first
+        // Check for string literal arguments before evaluation.
+        // String literals are valid as function arguments in PromQL (e.g., label_replace),
+        // but we don't yet support evaluating them as function arguments.
+        let arg = call.args.args[0].as_ref();
+        if let Expr::StringLiteral(lit) = arg {
+            return Err(EvaluationError::InternalError(format!(
+                "string literal \"{}\" passed as argument to function '{}': \
+                 string arguments are not yet supported",
+                lit.val, call.func.name
+            )));
+        }
+
+        // Evaluate the argument
         let arg_result = self
-            .evaluate_expr(
-                call.args.args[0].as_ref(),
-                start,
-                end,
-                interval,
-                lookback_delta,
-            )
+            .evaluate_expr(arg, start, end, interval, lookback_delta)
             .await?;
 
         let registry = FunctionRegistry::new();
@@ -1775,6 +1781,51 @@ mod tests {
         assert!(
             err.to_string().contains("string literal"),
             "Error message should mention 'string literal', got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn should_error_on_string_literal_as_function_argument() {
+        // given: create an empty mock reader
+        let bucket = TimeBucket::hour(1000);
+        let reader = MockQueryReaderBuilder::new(bucket).build();
+        let mut evaluator = Evaluator::new(&reader);
+
+        // when: evaluate a function call with a string literal argument
+        let end_time = UNIX_EPOCH + Duration::from_secs(2000);
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::Expr::Call(promql_parser::parser::Call {
+                func: promql_parser::parser::Function {
+                    name: "label_replace",
+                    arg_types: vec![],
+                    variadic: false,
+                    return_type: promql_parser::parser::ValueType::Vector,
+                },
+                args: promql_parser::parser::FunctionArgs {
+                    args: vec![Box::new(promql_parser::parser::Expr::StringLiteral(
+                        promql_parser::parser::StringLiteral {
+                            val: "replacement".to_string(),
+                        },
+                    ))],
+                },
+            }),
+            start: end_time,
+            end: end_time,
+            interval: Duration::from_secs(0),
+            lookback_delta: Duration::from_secs(300),
+        };
+
+        let result = evaluator.evaluate(stmt).await;
+
+        // then: should return a context-specific error (string arg not yet supported)
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("string literal")
+                && err.to_string().contains("label_replace")
+                && err.to_string().contains("not yet supported"),
+            "Error message should mention string literal, function name, and 'not yet supported', got: {}",
             err
         );
     }
