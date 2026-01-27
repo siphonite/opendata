@@ -100,19 +100,26 @@ fn convert_otlp_request(req: ExportMetricsServiceRequest) -> Vec<Series> {
 }
 
 pub async fn handle_otlp_metrics(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     body: Bytes,
 ) -> StatusCode {
     #[cfg(feature = "otlp")]
     {
-        let _request = match decode_otlp_request(&body) {
+        let request = match decode_otlp_request(&body) {
             Ok(req) => req,
             Err(_) => return StatusCode::BAD_REQUEST,
         };
 
-        let _series = convert_otlp_request(_request);
+        let series = convert_otlp_request(request);
+
+        if let Err(_) = state
+            .tsdb
+            .ingest_samples(series, state.flush_interval_secs)
+            .await
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
     }
 
-    // TODO: call tsdb.ingest_samples(...)
     StatusCode::OK
 }
