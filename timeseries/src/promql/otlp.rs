@@ -38,63 +38,62 @@ fn convert_otlp_request(req: ExportMetricsServiceRequest) -> Vec<Series> {
     for resource_metrics in req.resource_metrics {
         for scope_metrics in resource_metrics.scope_metrics {
             for metric in scope_metrics.metrics {
-                match metric.data {
-                    Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge)) => {
-                        for datapoint in gauge.data_points {
-                            // Extract timestamp (convert nanoseconds to milliseconds)
-                            let timestamp_ms = (datapoint.time_unix_nano / 1_000_000) as i64;
+                if let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge)) =
+                    metric.data
+                {
+                    for datapoint in gauge.data_points {
+                        // Extract timestamp (convert nanoseconds to milliseconds)
+                        let timestamp_ms = (datapoint.time_unix_nano / 1_000_000) as i64;
 
-                            // Extract value
-                            let value = match datapoint.value {
-                                Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(v)) => v,
-                                Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(v)) => v as f64,
-                                _ => continue,
-                            };
+                        // Extract value
+                        let value = match datapoint.value {
+                            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(v)) => v,
+                            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(v)) => v as f64,
+                            _ => continue,
+                        };
 
-                            // Convert datapoint attributes to labels
-                            let mut labels: Vec<Label> = datapoint
-                                .attributes
-                                .iter()
-                                .map(|kv| Label {
-                                    name: kv.key.clone(),
-                                    value: kv
-                                        .value
-                                        .as_ref()
-                                        .map(otlp_value_to_string)
-                                        .unwrap_or_default(),
-                                })
-                                .collect();
+                        // Convert datapoint attributes to labels
+                        let mut labels: Vec<Label> = datapoint
+                            .attributes
+                            .iter()
+                            .map(|kv| Label {
+                                name: kv.key.clone(),
+                                value: kv
+                                    .value
+                                    .as_ref()
+                                    .map(otlp_value_to_string)
+                                    .unwrap_or_default(),
+                            })
+                            .collect();
 
-                            // Add metric name as label
-                            labels.push(Label::metric_name(metric.name.clone()));
+                        // Add metric name as label
+                        labels.push(Label::metric_name(metric.name.clone()));
 
-                            // Sort labels for consistent fingerprinting
-                            labels.sort();
+                        // Sort labels for consistent fingerprinting
+                        labels.sort();
 
-                            // Create sample
-                            let sample = Sample::new(timestamp_ms, value);
+                        // Create sample
+                        let sample = Sample::new(timestamp_ms, value);
 
-                            // Create series
-                            let series = Series {
-                                labels,
-                                metric_type: Some(MetricType::Gauge),
-                                unit: if metric.unit.is_empty() {
-                                    None
-                                } else {
-                                    Some(metric.unit.clone())
-                                },
-                                description: if metric.description.is_empty() {
-                                    None
-                                } else {
-                                    Some(metric.description.clone())
-                                },
-                                samples: vec![sample],
-                            };
+                        // Create series
+                        let series = Series {
+                            labels,
+                            metric_type: Some(MetricType::Gauge),
+                            unit: if metric.unit.is_empty() {
+                                None
+                            } else {
+                                Some(metric.unit.clone())
+                            },
+                            description: if metric.description.is_empty() {
+                                None
+                            } else {
+                                Some(metric.description.clone())
+                            },
+                            samples: vec![sample],
+                        };
 
-                            series_list.push(series);
-                        }
+                        series_list.push(series);
                     }
-                    _ => {}
                 }
             }
         }
@@ -113,10 +112,11 @@ pub async fn handle_otlp_metrics(State(state): State<AppState>, body: Bytes) -> 
 
         let series = convert_otlp_request(request);
 
-        if let Err(_) = state
+        if state
             .tsdb
             .ingest_samples(series, state.flush_interval_secs)
             .await
+            .is_err()
         {
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
